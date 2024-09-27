@@ -1,48 +1,58 @@
-use tonic::transport::Channel;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+
 use fasthash::murmur3;
+use rand::{Rng, thread_rng};
 use rand::distributions::Uniform;
-use rand::{thread_rng, Rng};
+use tonic::transport::Channel;
+
+use crate::pb::greeter_client::GreeterClient;
+use crate::pb::HelloRequest;
+use crate::server::start_server;
+
+const VIRTUAL_NODE_SIZE: usize = 3;
+
+pub mod pb {
+    tonic::include_proto!("helloworld");
+}
 
 #[derive(Debug)]
 pub struct StaticSetConsitentHashingLBClient<T> {
-    /// BtreeMap<hashing_key, T refers grpc client channel>
     clients: BTreeMap<u32, T>,
-    /// Murmur hash function that return 32-bit unsigned integer for a byte array
     hasher: fn(&[u8]) -> u32,
 }
 
-/// Impl this trait on the grpc request struct to fetch the key from request which would be required to find next client in ring
 pub trait ConsistentHashingTrait {
     fn get_key(&self) -> String;
 }
 
-/// Impl this trait on grpc_client<channel> to create new channel from balance list, which will be inserted in to the ring
-pub trait NewFromChannel {
-    fn new(channel: Channel) -> Self;
+impl ConsistentHashingTrait for HelloRequest {
+    fn get_key(&self) -> String {
+        (&self.key.as_str()).parse().unwrap()
+    }
 }
 
-/// Based on fasthash crate (https://docs.rs/fasthash/latest/fasthash/murmur3/struct.Hash32.html)
-/// TODO: To be investigated and followed up if there any replacement one, as murmur3 had issues with new ARM MAC's (https://docs.rs/fasthash/latest/fasthash/murmur3/struct.Hash32.html)
 fn create_hash(val: &[u8]) -> u32 {
     murmur3::hash32(val)
 }
 
+// ASHWIN
+pub  trait NewFromChannel {
+    fn new(channel: Channel) -> Self;
+}
+
 impl<T: NewFromChannel> StaticSetConsitentHashingLBClient<T> {
-    /// Construct new StaticConsistentHashingLBClient with empty btree and murmur3 hash function
+    // ASHWIN
     pub async fn new() -> Self {
+        StaticSetConsitentHashingLBClient::with_hash(create_hash).await
+    }
+
+    pub async fn with_hash(hash_fn: fn(&[u8]) -> u32) -> Self {
         StaticSetConsitentHashingLBClient {
-            hasher: create_hash,
+            hasher: hash_fn,
             clients: BTreeMap::new(),
         }
     }
-
-    /// Add the static endpoint uri's to ring with chunks of 2 from tonic balance list to insert a new balanced client to the ring
-    /// Add the virtual node size as replica's to create virtual upstreams for more availability (Minimum 1)
-    /// Ring will be constructed as [(No of Static Endpoints/Chunk size) * Virtual node size]
-    /// For Example: No of static endpoints - 6, Virtual node size - 3, Chunk size - 2. So the ring size would be [(6/2)*3] 9 for the mentioned example
-    /// Initial 'key' for ring is inserted based on random i32 number generated between provided values in uniform sample distribution
     pub async fn add(&mut self, uris: &'static [&'static str], virtual_node_size: usize) {
         //let mut s = Self { clients: BTreeMap::new() };
 
@@ -57,17 +67,13 @@ impl<T: NewFromChannel> StaticSetConsitentHashingLBClient<T> {
 
                 let endpoint = u.iter().map(|e| Channel::from_static(e));
                 let channel = Channel::balance_list(endpoint);
-                let client = T::new(channel);
+                let client = T::new(channel); // ASHWIN
                 self.clients.insert(key, client);
             }
         }
     }
 
-    /// Find next balanced client in ring based on provided key from request, return option of <&Client>
-    /// Based on the key <str> provided, hash will be generated and will find the next key in the ring based on the ascending order
-    /// If number is with in key's range generated, will return next available key else will send the first key in ring along with respective client
-    /// For Example, Keys in ring [2027723236, 2123272817,2950756965] where as new key generated based on str input is '2114948387', so the next key would be '2123272817' and corresponding client
-    pub async fn find_next_client(&self, key: &str) -> Option<&T> {
+    pub async fn find_next_client(&self, key: &str) -> Option<&T> { // ASHWIN
         let key = key.as_bytes();
         if self.clients.is_empty() {
             return None;
@@ -87,37 +93,22 @@ impl<T: NewFromChannel> StaticSetConsitentHashingLBClient<T> {
         Some(v)
     }
 
-    /// Find the next balanced client from ring based on the key from request, return's Result<&Grpc_Client>
     pub async fn
     find<R>(
         &mut self,
         request: &R,
-    ) -> anyhow::Result<&T>
+    ) -> anyhow::Result<&T> // ASHWIN
         where
             R: ConsistentHashingTrait
     {
         let key = request.get_key();
+
         let c: &T = self.find_next_client(key.as_str()).await.unwrap();
         Ok(c)
     }
 }
 
-use crate::pb::HelloRequest;
-use crate::pb::greeter_client::GreeterClient;
-use crate::server::start_server;
-
-const VIRTUAL_NODE_SIZE: usize = 3;
-
-pub mod pb {
-    tonic::include_proto!("helloworld");
-}
-
-impl ConsistentHashingTrait for HelloRequest {
-    fn get_key(&self) -> String {
-        (&self.key.as_str()).parse().unwrap()
-    }
-}
-
+// ASHWIN
 impl NewFromChannel for GreeterClient<Channel> {
     fn new(channel: Channel) -> Self {
         GreeterClient::new(channel)
